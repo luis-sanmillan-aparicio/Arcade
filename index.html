@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PONG — Adrian vs Luis</title>
+<title>PONG — Jugador A vs Jugador B</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;900&display=swap');
 
@@ -250,7 +250,7 @@
 
 <!-- FIN -->
 <div id="screen-end">
-  <h2 id="end-msg">¡ADRIAN GANA!</h2>
+  <h2 id="end-msg">¡JUGADOR A GANA!</h2>
   <button id="btn-restart">JUGAR DE NUEVO</button>
 </div>
 
@@ -381,13 +381,11 @@ function choosePlayer(role) {
   isHost = (role === 'adrian');
 
   if (myRole === 'adrian') {
-    document.getElementById('hud-bottom-name').textContent = 'TÚ (ADRIAN)';
-    document.getElementById('hud-top-name').textContent    = 'LUIS';
-    // HUD: izquierda=LUIS (color --luis), derecha=ADRIAN (color --adrian) ← correcto por CSS
+    document.getElementById('hud-bottom-name').textContent = 'TÚ (JUG. A)';
+    document.getElementById('hud-top-name').textContent    = 'JUGADOR B';
   } else {
-    document.getElementById('hud-bottom-name').textContent = 'TÚ (LUIS)';
-    document.getElementById('hud-top-name').textContent    = 'ADRIAN';
-    // CORRECCIÓN COLORES HUD: para Luis, izquierda=ADRIAN (--adrian) y derecha=LUIS (--luis)
+    document.getElementById('hud-bottom-name').textContent = 'TÚ (JUG. B)';
+    document.getElementById('hud-top-name').textContent    = 'JUGADOR A';
     document.getElementById('hud-top').style.color    = 'var(--adrian)';
     document.getElementById('hud-bottom').style.color = 'var(--luis)';
   }
@@ -588,10 +586,10 @@ function loop(now) {
 // ── FIN ──────────────────────────────────────────────────
 function endGame() {
   gameRunning = false;
-  const winner = scoreAdrian >= SCORE_WIN ? 'ADRIAN' : 'LUIS';
+  const winner = scoreAdrian >= SCORE_WIN ? 'JUGADOR A' : 'JUGADOR B';
   document.getElementById('end-msg').textContent = `¡${winner} GANA!`;
   document.getElementById('end-msg').style.color =
-    winner === 'ADRIAN' ? 'var(--adrian)' : 'var(--luis)';
+    winner === 'JUGADOR A' ? 'var(--adrian)' : 'var(--luis)';
   show('screen-end');
 }
 
@@ -645,5 +643,6 @@ document.getElementById('btn-restart').addEventListener('click', () => {
 </script>
 </body>
 </html>
+
 
 
