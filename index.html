@@ -259,14 +259,22 @@
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────
-const SUPABASE_URL = 'https://rxbwfozedqipwvfhuzby.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_2G53T3tdGzdFVFYmdahPDw_65nxBsb-';
-const CHANNEL_NAME = 'pong-game-v1';
-const PADDLE_W_RATIO = 0.22;   // ancho paleta relativo al canvas
-const PADDLE_H = 10;
-const BALL_R = 8;
+const SUPABASE_URL  = 'https://rxbwfozedqipwvfhuzby.supabase.co';
+const SUPABASE_KEY  = 'sb_publishable_2G53T3tdGzdFVFYmdahPDw_65nxBsb-';
+const CHANNEL_NAME  = 'pong-game-v1';
+
+const PADDLE_W_RATIO = 0.22;   // ancho paleta relativo al canvas (x)
+
+// ── POSICIÓN DE PALETAS EN COORDENADAS NORMALIZADAS (0-1) ──
+// Usando fracciones del alto del canvas en lugar de píxeles fijos.
+// Así la física y el render son consistentes en cualquier pantalla.
+const PADDLE_TOP_NORM = 0.05;                                // borde exterior paleta superior (y desde arriba)
+const PADDLE_H_NORM   = 0.017;                               // alto de paleta como fracción de H
+const INNER_TOP = PADDLE_TOP_NORM + PADDLE_H_NORM;          // borde interior paleta superior (~0.067) → línea de colisión
+const INNER_BOT = 1 - INNER_TOP;                            // borde interior paleta inferior (~0.933) → línea de colisión
+
+const BALL_R = 8;              // radio pelota en píxeles (fijo visual)
 const SCORE_WIN = 5;
-const PADDLE_MARGIN = 30;
 const SPEED_INCREMENT = 0.08;  // aceleración por segundo
 
 // ── ESTADO ──────────────────────────────────────────────
@@ -278,7 +286,6 @@ let rivalConnected = false;
 let scoreAdrian = 0;
 let scoreLuis = 0;
 
-// Posiciones normalizadas 0..1
 let paddleAdrian = 0.5;
 let paddleLuis   = 0.5;
 
@@ -287,7 +294,6 @@ let gameRunning = false;
 let lastTime = null;
 let totalTime = 0;
 
-// Drag
 let dragging = false;
 let dragStartX = 0;
 let dragStartPaddle = 0;
@@ -302,8 +308,13 @@ function initChannel() {
 
   channel
     .on('broadcast', { event: 'presence' }, ({ payload }) => {
-      if (payload.role !== myRole) {
+      // CORRECCIÓN SINCRONÍA: cuando llega la presencia del rival,
+      // respondemos con la nuestra para que él también nos detecte
+      // (evita el race condition si uno entra antes que el otro).
+      if (payload.role !== myRole && !rivalConnected) {
         rivalConnected = true;
+        // Eco de vuelta: el rival puede estar esperando nuestra confirmación
+        channel.send({ type: 'broadcast', event: 'presence', payload: { role: myRole } });
         onRivalJoined();
       }
     })
@@ -329,8 +340,17 @@ function initChannel() {
     })
     .subscribe((status) => {
       if (status === 'SUBSCRIBED') {
-        // Anunciar presencia
-        channel.send({ type: 'broadcast', event: 'presence', payload: { role: myRole } });
+        // Anunciar presencia varias veces para cubrir el caso en que
+        // el rival llegue antes o después de nosotros.
+        const announce = () => {
+          if (!rivalConnected) {
+            channel.send({ type: 'broadcast', event: 'presence', payload: { role: myRole } });
+          }
+        };
+        announce();
+        setTimeout(announce, 1500);
+        setTimeout(announce, 3500);
+        setTimeout(announce, 6000);
       }
     });
 }
@@ -360,13 +380,16 @@ function choosePlayer(role) {
   myRole = role;
   isHost = (role === 'adrian');
 
-  // Orientar HUD según quién soy
   if (myRole === 'adrian') {
     document.getElementById('hud-bottom-name').textContent = 'TÚ (ADRIAN)';
     document.getElementById('hud-top-name').textContent    = 'LUIS';
+    // HUD: izquierda=LUIS (color --luis), derecha=ADRIAN (color --adrian) ← correcto por CSS
   } else {
     document.getElementById('hud-bottom-name').textContent = 'TÚ (LUIS)';
     document.getElementById('hud-top-name').textContent    = 'ADRIAN';
+    // CORRECCIÓN COLORES HUD: para Luis, izquierda=ADRIAN (--adrian) y derecha=LUIS (--luis)
+    document.getElementById('hud-top').style.color    = 'var(--adrian)';
+    document.getElementById('hud-bottom').style.color = 'var(--luis)';
   }
 
   show('screen-wait');
@@ -418,7 +441,7 @@ function resetBallLocal() {
   if (isHost) {
     const angle = (Math.random() * 60 - 30) * Math.PI / 180;
     const dir   = Math.random() < 0.5 ? 1 : -1;
-    const speed = 0.35; // unidades/segundo normalizadas
+    const speed = 0.35;
     ball.vx = Math.sin(angle) * speed;
     ball.vy = Math.cos(angle) * speed * dir;
     sendBall();
@@ -430,7 +453,6 @@ function physicsStep(dt) {
   if (!isHost || !gameRunning) return;
 
   totalTime += dt;
-  // Aceleración gradual
   const speedMult = 1 + totalTime * SPEED_INCREMENT;
 
   ball.x += ball.vx * dt * speedMult;
@@ -438,28 +460,29 @@ function physicsStep(dt) {
 
   const W = canvas.width;
   const H = canvas.height;
-  const br = BALL_R / W; // radio normalizado en X
+  const br  = BALL_R / W;
   const brY = BALL_R / H;
 
   // Rebote paredes laterales
   if (ball.x - br < 0) { ball.x = br; ball.vx = Math.abs(ball.vx); }
   if (ball.x + br > 1) { ball.x = 1 - br; ball.vx = -Math.abs(ball.vx); }
 
-  // Paleta arriba (Luis, y~0)
   const pw = PADDLE_W_RATIO / 2;
-  const topY    = (PADDLE_MARGIN + PADDLE_H) / H;
-  const bottomY = 1 - (PADDLE_MARGIN + PADDLE_H) / H;
+
+  // CORRECCIÓN: usar constantes normalizadas fijas en lugar de canvas.height del host.
+  // Esto garantiza que la colisión ocurre exactamente donde se ve la paleta
+  // en CUALQUIER pantalla, independientemente del tamaño.
+  const topY    = INNER_TOP;
+  const bottomY = INNER_BOT;
 
   // Colisión paleta superior (Luis)
   if (ball.vy < 0 && ball.y - brY < topY) {
     if (Math.abs(ball.x - paddleLuis) < pw) {
       ball.y = topY + brY;
       ball.vy = Math.abs(ball.vy);
-      // Añadir algo de efecto según dónde golpea
       const offset = (ball.x - paddleLuis) / pw;
       ball.vx += offset * 0.1;
     } else {
-      // Punto para Adrian
       scoreAdrian++;
       updateScoreUI();
       sendScore();
@@ -476,7 +499,6 @@ function physicsStep(dt) {
       const offset = (ball.x - paddleAdrian) / pw;
       ball.vx += offset * 0.1;
     } else {
-      // Punto para Luis
       scoreLuis++;
       updateScoreUI();
       sendScore();
@@ -496,22 +518,39 @@ function render() {
 
   const pw = PADDLE_W_RATIO * W;
 
-  // Paleta arriba
-  // Si soy Adrian: arriba es Luis (color luis)
-  // Si soy Luis: arriba es Adrian (color adrian)
-  const topColor    = myRole === 'adrian' ? getComputedStyle(document.documentElement).getPropertyValue('--luis').trim()   : getComputedStyle(document.documentElement).getPropertyValue('--adrian').trim();
-  const bottomColor = myRole === 'adrian' ? getComputedStyle(document.documentElement).getPropertyValue('--adrian').trim() : getComputedStyle(document.documentElement).getPropertyValue('--luis').trim();
+  const topColor    = myRole === 'adrian'
+    ? getComputedStyle(document.documentElement).getPropertyValue('--luis').trim()
+    : getComputedStyle(document.documentElement).getPropertyValue('--adrian').trim();
+  const bottomColor = myRole === 'adrian'
+    ? getComputedStyle(document.documentElement).getPropertyValue('--adrian').trim()
+    : getComputedStyle(document.documentElement).getPropertyValue('--luis').trim();
 
-  // Posición de la paleta rival arriba y la mía abajo
+  // Paleta de arriba en la pantalla de cada jugador = rival
+  // Paleta de abajo = yo mismo
   const topPaddleX    = myRole === 'adrian' ? paddleLuis   : paddleAdrian;
   const bottomPaddleX = myRole === 'adrian' ? paddleAdrian : paddleLuis;
+
+  // CORRECCIÓN RENDER: usar posiciones normalizadas coherentes con la física.
+  //
+  // Para ADRIÁN (sin inversión y→píxel):
+  //   paleta rival (Luis) arriba:   borde interior en INNER_TOP·H → se dibuja encima
+  //   paleta propia (Adrian) abajo: borde interior en INNER_BOT·H → se dibuja debajo
+  //
+  // Para LUIS (campo invertido, (1-y)·H):
+  //   su rival (Adrian) aparece arriba → borde interior en (1-INNER_BOT)·H = INNER_TOP·H → igual
+  //   su propia paleta aparece abajo   → borde interior en (1-INNER_TOP)·H = INNER_BOT·H → igual
+  //
+  // Resultado: ¡la fórmula es idéntica para ambos jugadores! El campo ya se
+  // invierte implícitamente al asignar topPaddleX / bottomPaddleX.
+
+  const paddleHpx = PADDLE_H_NORM * H;
 
   // Paleta arriba (rival)
   ctx.fillStyle = topColor;
   ctx.shadowColor = topColor;
   ctx.shadowBlur = 12;
   ctx.beginPath();
-  ctx.roundRect(topPaddleX * W - pw/2, PADDLE_MARGIN, pw, PADDLE_H, 5);
+  ctx.roundRect(topPaddleX * W - pw / 2, INNER_TOP * H - paddleHpx, pw, paddleHpx, 5);
   ctx.fill();
 
   // Paleta abajo (yo)
@@ -519,11 +558,10 @@ function render() {
   ctx.shadowColor = bottomColor;
   ctx.shadowBlur = 18;
   ctx.beginPath();
-  ctx.roundRect(bottomPaddleX * W - pw/2, H - PADDLE_MARGIN - PADDLE_H, pw, PADDLE_H, 5);
+  ctx.roundRect(bottomPaddleX * W - pw / 2, INNER_BOT * H, pw, paddleHpx, 5);
   ctx.fill();
 
-  // Bola
-  // Invertir Y si soy Luis (porque veo el campo al revés)
+  // Bola — Luis ve el campo al revés en Y
   const ballScreenX = ball.x * W;
   const ballScreenY = myRole === 'luis' ? (1 - ball.y) * H : ball.y * H;
 
@@ -574,13 +612,13 @@ canvas.addEventListener('pointerdown', e => {
 canvas.addEventListener('pointermove', e => {
   if (!dragging) return;
   const dx = getCanvasX(e) - dragStartX;
-  let newX = Math.max(PADDLE_W_RATIO/2, Math.min(1 - PADDLE_W_RATIO/2, dragStartPaddle + dx));
+  let newX = Math.max(PADDLE_W_RATIO / 2, Math.min(1 - PADDLE_W_RATIO / 2, dragStartPaddle + dx));
   if (myRole === 'adrian') paddleAdrian = newX;
   else paddleLuis = newX;
   sendPaddle(newX);
 });
 
-canvas.addEventListener('pointerup',   () => dragging = false);
+canvas.addEventListener('pointerup',    () => dragging = false);
 canvas.addEventListener('pointercancel',() => dragging = false);
 
 // ── BOTONES ──────────────────────────────────────────────
@@ -607,3 +645,4 @@ document.getElementById('btn-restart').addEventListener('click', () => {
 </script>
 </body>
 </html>
+
