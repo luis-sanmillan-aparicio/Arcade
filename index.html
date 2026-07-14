@@ -601,6 +601,14 @@ function initChannel() {
       // Se manda ÚNICAMENTE cuando la bola cambia de trayectoria
       // (pared, paleta o reset), no en cada frame.
       lastBallEvent = { ...payload, tLocal: performance.now() };
+      // El no-host también debe reflejar la velocidad actual en el objeto
+      // "ball" real: si no, ball.vx/vy se quedan congelados en 0,0 desde
+      // el arranque y el chequeo "ball.vx === 0 && ball.vy === 0" (usado
+      // para bloquear el movimiento de paleta antes de que salga la bola)
+      // pasa a ser permanentemente verdadero, anulando el arrastre de ese
+      // jugador durante toda la partida.
+      ball.vx = payload.vx;
+      ball.vy = payload.vy;
       logEvent('ball_event recibido x=' + payload.x.toFixed(3) + ' y=' + payload.y.toFixed(3) +
         ' vx=' + payload.vx.toFixed(3) + ' vy=' + payload.vy.toFixed(3));
     })
@@ -626,6 +634,11 @@ function initChannel() {
           totalTime: payload.ball.totalTime,
           tLocal: performance.now()
         };
+        // Mismo motivo que en ball_event: mantener ball.vx/vy reales
+        // sincronizados para que el chequeo de "bola congelada" antes de
+        // arrastrar la paleta funcione también en el cliente no-host.
+        ball.vx = payload.ball.vx;
+        ball.vy = payload.ball.vy;
       }
     })
     .on('broadcast', { event: 'pause' }, () => {
@@ -1151,3 +1164,4 @@ document.getElementById('btn-restart').addEventListener('click', () => {
 </script>
 </body>
 </html>
+
