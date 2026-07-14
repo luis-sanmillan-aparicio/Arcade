@@ -797,6 +797,7 @@ document.getElementById('secret-p').addEventListener('click', onSecretPTap);
 // como si fuera un movimiento normal — el rival no nota diferencia.
 function updateBot() {
   if (!botMode) return;
+  if (ball.vx === 0 && ball.vy === 0) return;
   const target = Math.max(PADDLE_W_RATIO / 2, Math.min(1 - PADDLE_W_RATIO / 2, ball.x));
   if (myRole === 'adrian') paddleAdrian = target;
   else paddleLuis = target;
