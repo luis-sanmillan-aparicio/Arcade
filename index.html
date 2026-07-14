@@ -917,6 +917,15 @@ function hostResetBall() {
   ball.vy = Math.cos(angle) * speed * dir;
   sendBallEvent();
 }
+function freezeBallThenReset() {
+  ball.vx = 0;
+  ball.vy = 0;
+  sendBallEvent(); // el rival también verá la bola congelada ahí
+  logEvent('Bola congelada 5s en x=' + ball.x.toFixed(3) + ' y=' + ball.y.toFixed(3));
+  setTimeout(() => {
+    if (gameRunning) hostResetBall();
+  }, 5000);
+}
 
 function physicsStep(dt) {
   if (!isHost || !gameRunning || connectionPaused) return;
