@@ -988,7 +988,7 @@ function physicsStep(dt) {
       updateScoreUI();
       sendScore();
       logEvent('Punto para B (local, host) — marcador ' + scoreAdrian + '-' + scoreLuis);
-      if (scoreLuis < SCORE_WIN) hostResetBall();
+      if (scoreLuis < SCORE_WIN) freezeBallThenReset();
       else { endGame(); return; }
     }
   }
