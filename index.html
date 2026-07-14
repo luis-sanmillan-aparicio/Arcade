@@ -1116,6 +1116,7 @@ canvas.addEventListener('pointerdown', e => {
 
 canvas.addEventListener('pointermove', e => {
   if (botMode || !dragging) return;
+  if (ball.vx === 0 && ball.vy === 0) return;
   const dx = getCanvasX(e) - dragStartX;
   let newX = Math.max(PADDLE_W_RATIO / 2, Math.min(1 - PADDLE_W_RATIO / 2, dragStartPaddle + dx));
   if (myRole === 'adrian') paddleAdrian = newX;
