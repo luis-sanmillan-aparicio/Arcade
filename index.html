@@ -370,10 +370,43 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
 <script>
+// ═══════════════════════════════════════════════════════════════════════
+// MODELO DE RED: TRANSMISIÓN DE "RAYOS" (trayectorias completas)
+// ═══════════════════════════════════════════════════════════════════════
+// Un RAYO es la trayectoria total de la bola desde que sale de una paleta
+// (o del saque) hasta que llega a la línea de paleta contraria, incluyendo
+// TODOS los rebotes de pared por el camino (2, 3 o más). Se describe con
+// una fórmula cerrada —posición inicial + velocidad CONSTANTE— y por eso
+// se puede calcular de antemano, en el mismo instante en que se genera:
+//   · el instante exacto (tImpact) en el que llegará a la línea de paleta
+//     contraria, y la coordenada x en la que llegará (xImpact), ya
+//     incluyendo el plegado de los rebotes de pared.
+//   · por si acaso no hay paleta ahí, también el instante (tEdge) y la
+//     x (xEdge) en las que llegaría al borde REAL de la pantalla.
+// Ese único rayo se transmite UNA vez a Supabase (no un evento por cada
+// rebote de pared: esos van "incluidos" en la fórmula) y ambos
+// dispositivos lo "reproducen" con la misma función de teatro
+// (ballPositionForRay), cada uno anclando su propio reloj local al
+// instante en que empieza a reproducirlo — inmediatamente si lo generó
+// él mismo, con el retraso de red correspondiente si lo ha recibido.
+//
+// Sólo el dispositivo hacia el que apunta el rayo (targetRole) decide algo:
+// en el instante tImpact comprueba, con SU paleta local (sin red de por
+// medio), si la bola cae dentro de ella. Si sí: calcula el rayo de vuelta
+// y lo transmite. Si no: dice nada todavía —la propia fórmula ya lleva a
+// la bola hasta el borde real— y es en tEdge cuando cuenta el gol,
+// congela la bola 5s y transmite ese "rayo de gol". El otro dispositivo
+// no decide nada: sólo reproduce lo que le llega.
+//
+// Velocidad constante DENTRO de un mismo rayo (para poder calcular el
+// impacto con exactitud); la dificultad sube por CONTADOR DE TOQUES
+// (cada rebote de paleta), no de forma continua en el tiempo.
+// ═══════════════════════════════════════════════════════════════════════
+
 // ── CONFIG ──────────────────────────────────────────────
 const SUPABASE_URL  = 'https://rxbwfozedqipwvfhuzby.supabase.co';
 const SUPABASE_KEY  = 'sb_publishable_2G53T3tdGzdFVFYmdahPDw_65nxBsb-';
-const CHANNEL_NAME  = 'pong-game-v1';
+const CHANNEL_NAME  = 'pong-game-v2';
 
 const PADDLE_W_RATIO = 0.22;   // ancho paleta relativo al canvas (x)
 
@@ -383,17 +416,41 @@ const PADDLE_H_NORM   = 0.017;
 const INNER_TOP = PADDLE_TOP_NORM + PADDLE_H_NORM;
 const INNER_BOT = 1 - INNER_TOP;
 
-const BALL_R = 8;
+const BALL_R = 8;          // px — sólo para dibujar
+const BALL_R_NORM = 0.014; // radio normalizado usado en la física del
+                            // rayo — FIJO, no depende del ancho de
+                            // pantalla de cada móvil, para que los
+                            // rebotes de pared salgan calculados de
+                            // forma IDÉNTICA en los dos dispositivos.
+
 const SCORE_WIN = 5;
-const SPEED_INCREMENT = 0.08;  // aceleración por segundo
+
+// Velocidad: constante dentro de cada rayo, sube por contador de toques.
+// Ambas son las variables a tocar para ajustar la dificultad/progresión.
+const BASE_SPEED = 0.35;       // unidades normalizadas / segundo, en el saque
+const SPEED_PER_TOUCH = 0.06;  // incremento relativo por cada toque de paleta
+const SERVE_MAX_ANGLE  = 30 * Math.PI / 180; // abanico del saque
+const PADDLE_MAX_ANGLE = 60 * Math.PI / 180; // abanico del rebote en paleta,
+                                              // según en qué punto golpees
+
+// Frecuencia de transmisión de la posición de paleta: es una señal
+// puramente decorativa (ver comentario en sendPaddle) que no participa en
+// ningún cálculo del rayo — se deja aquí como variable ajustable para
+// poder subirla o bajarla y usarla como termómetro de cuándo se satura
+// Supabase, sin que afecte nunca a la física del juego.
+const PADDLE_SEND_INTERVAL = 50; // ms → máx. ~20 envíos/segundo
 
 // Seguro de sincronía: latido periódico + timeout de pausa simétrica
 const HEARTBEAT_INTERVAL = 1000; // ms entre latidos
 const HEARTBEAT_TIMEOUT  = 3000; // ms sin señal del rival → pausa
 
+// Gol en el borde real: en vez de anotar en la línea de paleta, dejamos
+// que el propio rayo lleve a la bola hasta el borde físico de la
+// pantalla, y ahí se congela este tiempo antes de servir de nuevo.
+const GOAL_FREEZE_DURATION = 5000; // ms
+
 // ── ESTADO ──────────────────────────────────────────────
 let myRole = null;        // 'adrian' | 'luis'
-let isHost = false;       // adrian es host (calcula física)
 let channel = null;
 let rivalConnected = false;
 
@@ -403,36 +460,28 @@ let scoreLuis = 0;
 let paddleAdrian = 0.5;
 let paddleLuis   = 0.5;
 
-let ball = { x: 0.5, y: 0.5, vx: 0, vy: 0 };
+// Posición visual de la bola, recalculada cada frame a partir del rayo
+// actual — nunca se integra directamente, siempre sale de la fórmula.
+let ball = { x: 0.5, y: 0.5 };
+
 let gameRunning = false;
-let lastTime = null;
-let totalTime = 0;
+
+// El rayo que se está reproduciendo ahora mismo (mío o recibido) y el
+// instante LOCAL (performance.now()) en el que empecé a reproducirlo en
+// ESTE dispositivo — la única referencia de tiempo que usamos, así que
+// nunca hace falta sincronizar relojes entre los dos móviles.
+let currentRay = null;
+let rayPlaybackStart = 0;
 
 let dragging = false;
 let dragStartX = 0;
 let dragStartPaddle = 0;
 
-// Sincronización basada en eventos (no-host reconstruye la trayectoria)
-// lastBallEvent guarda el último punto de "verdad" recibido del host
-// (rebote en pared, rebote en paleta o reset) junto con el instante LOCAL
-// (performance.now(), no Date.now()) en que llegó. Así evitamos cualquier
-// problema de desfase de reloj entre los dos móviles: cada cliente sólo
-// compara su propio reloj consigo mismo.
-let lastBallEvent = null;
-
-// Gol en el borde real: en vez de anotar en la línea de la paleta, dejamos
-// que la bola siga hasta el borde físico de la pantalla (y=0 / y=1) y ahí
-// se detiene 5s antes de servir de nuevo — las paletas siguen funcionando
-// con normalidad durante esos 5s, no hace falta congelar nada más.
-const GOAL_FREEZE_DURATION = 5000; // ms
-let missedTop = false;    // Luis ya ha fallado esta jugada, la bola va camino del borde
-let missedBottom = false; // Adrian ya ha fallado esta jugada, la bola va camino del borde
-let goalPending = false;  // true entre finalizeGoal() y el siguiente saque/fin — detiene physicsStep entero
-
 // Seguro de sincronía
 let lastHeartbeatReceived = 0;
 let heartbeatTimer = null;
 let connectionPaused = false;
+let pauseStartedAt = null; // para descontar el tiempo de pausa del reloj del rayo al reanudar
 
 // Reconexión automática del canal Supabase tras un CLOSED/CHANNEL_ERROR/
 // TIMED_OUT — sin esto, un corte de WebSocket deja la partida pausada
@@ -602,21 +651,26 @@ function initChannel() {
       }
     })
     .on('broadcast', { event: 'paddle' }, ({ payload }) => {
+      // Puramente cosmético: sólo para dibujar la paleta del rival en mi
+      // pantalla. Nunca participa en ningún cálculo del rayo — cada
+      // jugador sólo comprueba el impacto contra SU PROPIA paleta local
+      // — así que da igual que llegue con cierto retraso de red.
       if (payload.role === 'adrian') paddleAdrian = payload.x;
       else paddleLuis = payload.x;
     })
-    .on('broadcast', { event: 'ball_event' }, ({ payload }) => {
-      // Sólo lo consume el no-host: nueva base exacta de extrapolación.
-      // Se manda ÚNICAMENTE cuando la bola cambia de trayectoria
-      // (pared, paleta, reset o gol), no en cada frame.
-      lastBallEvent = { ...payload, tLocal: performance.now() };
-      logEvent('ball_event recibido x=' + payload.x.toFixed(3) + ' y=' + payload.y.toFixed(3) +
-        ' vx=' + payload.vx.toFixed(3) + ' vy=' + payload.vy.toFixed(3) + (payload.goal ? ' [GOL]' : ''));
+    .on('broadcast', { event: 'ray' }, ({ payload }) => {
+      // Un rayo completo (saque, rebote de paleta, o gol), generado por
+      // quien golpeó la bola. Lo adopto y empiezo a reproducirlo desde
+      // ya —con MI reloj local— y, si me toca a mí (targetRole ===
+      // myRole), el propio bucle principal se encargará de decidir en
+      // tImpact/tEdge cuando llegue el momento.
+      currentRay = { ...payload, resolved: false, missed: false, goalFinalized: false };
+      rayPlaybackStart = performance.now();
+      logEvent('rayo recibido objetivo=' + payload.targetRole +
+        ' x0=' + payload.x0.toFixed(3) + ' y0=' + payload.y0.toFixed(3) +
+        ' vx=' + payload.vx.toFixed(3) + ' vy=' + payload.vy.toFixed(3) +
+        (payload.goal ? ' [GOL]' : (' tImpact=' + payload.tImpact.toFixed(2) + 's')));
       if (payload.goal) {
-        // vx=vy=0 ya deja la bola quieta sola (la extrapolación no mueve
-        // nada con velocidad cero); solo hace falta decidir el fin de
-        // partida pasados los mismos 5s que espera el host.
-        logEvent('Gol confirmado — bola parada ' + (GOAL_FREEZE_DURATION / 1000) + 's');
         setTimeout(() => {
           if (payload.willEndGame) endGame();
         }, GOAL_FREEZE_DURATION);
@@ -627,24 +681,22 @@ function initChannel() {
       scoreLuis   = payload.luis;
       updateScoreUI();
       logEvent('score recibido A=' + payload.adrian + ' B=' + payload.luis);
-      // El fin de partida (si procede) lo dispara el ball_event de gol,
-      // pasados los 5s de pausa — no aquí directamente.
+      // El fin de partida (si procede) lo dispara el rayo de gol, pasados
+      // los 5s de pausa — no aquí directamente.
     })
     .on('broadcast', { event: 'heartbeat' }, ({ payload }) => {
       const wasPaused = connectionPaused;
       lastHeartbeatReceived = performance.now();
       if (connectionPaused) resumeConnection();
       logEvent('heartbeat recibido de ' + payload.role + (wasPaused ? ' (reanuda tras pausa)' : ''));
-      // El host adjunta una foto instantánea de la bola en cada latido:
-      // sirve de resincronización periódica de cortesía, por si algún
-      // ball_event se hubiera perdido por el camino.
-      if (!isHost && payload.ball) {
-        lastBallEvent = {
-          x: payload.ball.x, y: payload.ball.y,
-          vx: payload.ball.vx, vy: payload.ball.vy,
-          totalTime: payload.ball.totalTime,
-          tLocal: performance.now()
-        };
+      // Red de seguridad: si por lo que sea me he quedado sin rayo
+      // (p.ej. me acabo de reconectar a media jugada y me perdí el
+      // evento 'ray'), adopto el que traiga el latido, restando el
+      // tiempo que ya llevaba jugándose para no reiniciarlo desde cero.
+      if (payload.ray && !currentRay) {
+        currentRay = { ...payload.ray, resolved: false, missed: false, goalFinalized: false };
+        rayPlaybackStart = performance.now() - (payload.elapsed || 0) * 1000;
+        logEvent('Rayo adoptado desde heartbeat (resync de emergencia)');
       }
     })
     .on('broadcast', { event: 'pause' }, () => {
@@ -690,7 +742,7 @@ function initChannel() {
 
 // Reintenta crear y suscribir el canal con espera progresiva
 // (1s, 1.5s, 2.25s… hasta un máximo de 8s), sin tocar el marcador ni
-// el rol/host ya establecidos. Espera de verdad a que el canal antiguo
+// el rol ya establecido. Espera de verdad a que el canal antiguo
 // termine de limpiarse (removeChannel es asíncrono) antes de crear el
 // nuevo, para no tener dos suscripciones al mismo topic solapadas.
 function scheduleReconnect() {
@@ -711,12 +763,13 @@ function scheduleReconnect() {
   }, delay);
 }
 
-// Tope de envíos: sin esto, el modo bot (que llama a esto en cada
-// fotograma, ~60/s) o un arrastre manual muy rápido pueden superar el
-// límite de mensajes por segundo de Supabase y provocar un CLOSED real.
-const PADDLE_SEND_INTERVAL = 50; // ms → máx. ~20 envíos/segundo
 let lastPaddleSentAt = 0;
 
+// Sólo sirve para que el rival vea mi paleta dibujada en su pantalla —
+// nunca participa en ningún cálculo del rayo (cada uno comprueba el
+// impacto sólo contra su propia paleta, siempre local). Por eso da igual
+// el retraso y por eso PADDLE_SEND_INTERVAL es una variable de ajuste
+// "de cortesía": sirve para no saturar Supabase, no para la física.
 function sendPaddle(x) {
   const now = performance.now();
   if (now - lastPaddleSentAt < PADDLE_SEND_INTERVAL) return;
@@ -724,22 +777,10 @@ function sendPaddle(x) {
   channel.send({ type: 'broadcast', event: 'paddle', payload: { role: myRole, x } });
 }
 
-// Sólo se llama en el HOST, y sólo en el instante exacto en que la bola
-// cambia de vector (pared, paleta, reset o gol) — no en cada frame.
-// 'extra' permite añadir el marcado de gol: { goal: true, willEndGame }.
-function sendBallEvent(extra) {
-  const payload = { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, totalTime };
-  if (extra) Object.assign(payload, extra);
-  channel.send({ type: 'broadcast', event: 'ball_event', payload });
-  logEvent('ball_event enviado (host) x=' + ball.x.toFixed(3) + ' y=' + ball.y.toFixed(3) +
-    ' vx=' + ball.vx.toFixed(3) + ' vy=' + ball.vy.toFixed(3) +
-    (extra && extra.goal ? ' [GOL, fin=' + extra.willEndGame + ']' : ''));
-}
-
 function sendScore() {
   channel.send({ type: 'broadcast', event: 'score',
     payload: { adrian: scoreAdrian, luis: scoreLuis } });
-  logEvent('score enviado (host) A=' + scoreAdrian + ' B=' + scoreLuis);
+  logEvent('score enviado (' + myRole + ') A=' + scoreAdrian + ' B=' + scoreLuis);
 }
 
 // ── SEGURO DE SINCRONÍA (latido + pausa simétrica) ───────
@@ -748,9 +789,11 @@ function startHeartbeat() {
   lastHeartbeatReceived = performance.now();
   heartbeatTimer = setInterval(() => {
     if (!channel) return;
-    const payload = isHost
-      ? { role: myRole, ball: { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, totalTime } }
-      : { role: myRole };
+    const payload = { role: myRole };
+    if (currentRay) {
+      payload.ray = currentRay;
+      payload.elapsed = Math.max(0, (performance.now() - rayPlaybackStart) / 1000);
+    }
     try {
       channel.send({ type: 'broadcast', event: 'heartbeat', payload });
     } catch (e) {
@@ -776,6 +819,7 @@ function updatePauseOverlayText(text) {
 function triggerPause(reason) {
   if (connectionPaused) return;
   connectionPaused = true;
+  pauseStartedAt = performance.now();
   document.getElementById('pause-overlay').classList.add('active');
   updatePauseOverlayText('esperando señal del rival');
   logEvent('⚠ PAUSA activada — ' + (reason || 'motivo desconocido'));
@@ -791,10 +835,17 @@ function triggerPause(reason) {
 function resumeConnection() {
   if (!connectionPaused) return;
   connectionPaused = false;
+  // El reloj del rayo se ancla a performance.now(), que sigue avanzando
+  // durante la pausa: sin este ajuste, al reanudar la bola "saltaría"
+  // hacia delante todo lo que ha durado la pausa. Lo compensamos
+  // desplazando rayPlaybackStart exactamente ese tiempo.
+  if (pauseStartedAt && currentRay) {
+    rayPlaybackStart += (performance.now() - pauseStartedAt);
+  }
+  pauseStartedAt = null;
   document.getElementById('pause-overlay').classList.remove('active');
   updatePauseOverlayText('esperando señal del rival');
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  lastTime = performance.now();
   logEvent('✓ Reanudado tras pausa');
 }
 
@@ -835,14 +886,13 @@ function show(id) {
 
 function choosePlayer(role) {
   myRole = role;
-  isHost = (role === 'adrian');
 
   if (secretModeArmed) {
     botMode = true;
     secretModeArmed = false;
   }
 
-  logEvent('Rol elegido: ' + role + (isHost ? ' (host)' : '') + (botMode ? ' [BOT activo]' : ''));
+  logEvent('Rol elegido: ' + role + (botMode ? ' [BOT activo]' : ''));
 
   if (myRole === 'adrian') {
     document.getElementById('hud-bottom-name').textContent = 'TÚ (JUG. A)';
@@ -869,20 +919,20 @@ function tryStartRestart() {
 
   scoreAdrian = 0; scoreLuis = 0;
   updateScoreUI();
-  lastBallEvent = null;
+  currentRay = null;
+  ball = { x: 0.5, y: 0.5 };
   connectionPaused = false;
+  pauseStartedAt = null;
   document.getElementById('pause-overlay').classList.remove('active');
   show('screen-game');
-  if (isHost) {
+  if (myRole === 'adrian') {
     setTimeout(() => {
-      hostResetBall();
+      resetBallAsServer();
       gameRunning = true;
-      lastTime = performance.now();
       requestAnimationFrame(loop);
     }, 300);
   } else {
     gameRunning = true;
-    lastTime = performance.now();
     requestAnimationFrame(loop);
   }
 }
@@ -892,16 +942,18 @@ function onRivalJoined() {
   show('screen-game');
   resizeCanvas();
   startHeartbeat();
-  if (isHost) {
+  if (myRole === 'adrian') {
+    // Convención fija sólo para el saque inicial de la partida: alguien
+    // tiene que generar el primer rayo. No afecta a la equidad del punto
+    // en sí (el objetivo del saque sale a cara o cruz) — el resto de
+    // saques los genera quien encaja cada gol.
     setTimeout(() => {
-      hostResetBall();
+      resetBallAsServer();
       gameRunning = true;
-      lastTime = performance.now();
       requestAnimationFrame(loop);
     }, 800);
   } else {
     gameRunning = true;
-    lastTime = performance.now();
     requestAnimationFrame(loop);
   }
 }
@@ -926,136 +978,167 @@ function resizeCanvas() {
 }
 window.addEventListener('resize', resizeCanvas);
 
-// ── FÍSICA (sólo host = Adrian) ──────────────────────────
-function hostResetBall() {
-  if (!isHost) return;
-  ball.x = 0.5;
-  ball.y = 0.5;
-  totalTime = 0;
-  missedTop = false;
-  missedBottom = false;
-  goalPending = false;
-  const angle = (Math.random() * 60 - 30) * Math.PI / 180;
-  const dir   = Math.random() < 0.5 ? 1 : -1;
-  const speed = 0.35;
-  ball.vx = Math.sin(angle) * speed;
-  ball.vy = Math.cos(angle) * speed * dir;
-  sendBallEvent();
+// ── FÍSICA DEL RAYO ──────────────────────────────────────
+
+function opponentOf(role) {
+  return role === 'adrian' ? 'luis' : 'adrian';
 }
 
-// Se llama SOLO en el host, en el instante exacto en que la bola alcanza
-// el borde real de la pantalla tras haber fallado la paleta. Suma el
-// punto, deja la bola parada (velocidad 0 → la extrapolación del rival ya
-// la deja quieta sola) y programa el siguiente saque (o el fin de
-// partida) pasados GOAL_FREEZE_DURATION. Las paletas siguen funcionando
-// con normalidad durante esa espera.
-function finalizeGoal(winnerRole) {
-  goalPending = true; // detiene physicsStep entero — si no, esta misma
-                       // condición de borde seguiría siendo cierta cada
-                       // frame durante los 5s y volvería a sumar el punto
+// Refleja una coordenada "desplegada" (u, que puede ser cualquier real)
+// dentro de [lo, hi] simulando rebotes perfectos — la misma idea que
+// "doblar" una tira de papel: cada vez que se pasa de un extremo, se
+// pliega hacia atrás. Con esto calculamos, en un solo paso, la posición
+// x exacta de la bola aunque haya rebotado varias veces contra las
+// paredes laterales, sin tener que simular rebote a rebote.
+function foldX(u, lo, hi) {
+  const range = hi - lo;
+  const period = 2 * range;
+  let m = (u - lo) % period;
+  if (m < 0) m += period;
+  if (m > range) m = period - m;
+  return lo + m;
+}
+
+// Construye la descripción completa de un rayo: de dónde sale, con qué
+// velocidad (constante) y hacia quién va, calculando de antemano tanto
+// el instante/posición de llegada a la línea de paleta contraria como,
+// por si no hay paleta, el instante/posición de llegada al borde real.
+function buildRay(x0, y0, vx, vy, targetRole, touchCount) {
+  const targetY = targetRole === 'adrian' ? INNER_BOT : INNER_TOP;
+  const edgeY   = targetRole === 'adrian' ? 1 : 0;
+  const tImpact = (targetY - y0) / vy;
+  const xImpact = foldX(x0 + vx * tImpact, BALL_R_NORM, 1 - BALL_R_NORM);
+  const tEdge   = (edgeY - y0) / vy;
+  const xEdge   = foldX(x0 + vx * tEdge, BALL_R_NORM, 1 - BALL_R_NORM);
+  return { x0, y0, vx, vy, targetRole, tImpact, xImpact, tEdge, xEdge, touchCount, goal: false };
+}
+
+// La "función de teatro": posición de la bola en un rayo dado, a los
+// "elapsed" segundos de haber empezado a reproducirlo. Es la MISMA
+// fórmula para quien generó el rayo y para quien lo recibió — sólo
+// cambia el instante local (rayPlaybackStart) desde el que cada uno
+// cuenta ese "elapsed".
+function ballPositionForRay(ray, elapsed) {
+  if (ray.goal) return { x: ray.x0, y: ray.y0 };
+  const x = foldX(ray.x0 + ray.vx * elapsed, BALL_R_NORM, 1 - BALL_R_NORM);
+  const y = Math.min(1, Math.max(0, ray.y0 + ray.vy * elapsed));
+  return { x, y };
+}
+
+// La llama quien genera el rayo: quien saca, o quien acaba de devolver
+// un golpe. Lo transmite Y empieza a reproducirlo de inmediato en su
+// propio dispositivo (retraso ~0) — el rival lo recibirá con el retraso
+// de red que corresponda y arrancará su propia reproducción en ese
+// instante (ver el handler del evento 'ray').
+function sendRay(ray) {
+  channel.send({ type: 'broadcast', event: 'ray', payload: ray });
+  currentRay = { ...ray, resolved: false, missed: false, goalFinalized: false };
+  rayPlaybackStart = performance.now();
+  logEvent('rayo enviado (' + myRole + ') objetivo=' + ray.targetRole +
+    ' x0=' + ray.x0.toFixed(3) + ' y0=' + ray.y0.toFixed(3) +
+    ' vx=' + ray.vx.toFixed(3) + ' vy=' + ray.vy.toFixed(3) +
+    (ray.goal ? ' [GOL, fin=' + ray.willEndGame + ']' : ' tImpact=' + ray.tImpact.toFixed(2) + 's'));
+}
+
+// Saque: por convención, Jugador A lo genera el primero de cada partida;
+// después, siempre lo genera quien acaba de encajar el gol. El objetivo
+// (a quién de los dos va dirigido) sale a cara o cruz.
+function resetBallAsServer() {
+  const angle = (Math.random() * 2 - 1) * SERVE_MAX_ANGLE;
+  const dir   = Math.random() < 0.5 ? 1 : -1; // cara o cruz: a quién apunta
+  const vx = Math.sin(angle) * BASE_SPEED;
+  const vy = Math.cos(angle) * BASE_SPEED * dir;
+  const targetRole = vy > 0 ? 'adrian' : 'luis';
+  sendRay(buildRay(0.5, 0.5, vx, vy, targetRole, 0));
+}
+
+// Sólo la ejecuta el dispositivo objetivo (myRole === ray.targetRole),
+// exactamente en el instante tImpact calculado de antemano, comprobando
+// su PROPIA paleta LOCAL — sin ninguna dependencia de red en esa
+// comprobación. Si golpea, calcula el rayo de vuelta (ángulo según el
+// punto de la paleta en que incide, velocidad según el nuevo contador de
+// toques) y lo transmite; si no, deja constancia de que ha fallado y la
+// misma reproducción del rayo se encarga de llevar la bola hasta el
+// borde real (ver updateBall).
+function resolveImpact(ray) {
+  const myPaddle = myRole === 'adrian' ? paddleAdrian : paddleLuis;
+  const pw = PADDLE_W_RATIO / 2;
+
+  if (Math.abs(ray.xImpact - myPaddle) < pw) {
+    const offset = (ray.xImpact - myPaddle) / pw; // -1..1
+    const newTouch = ray.touchCount + 1;
+    const speed = BASE_SPEED * (1 + newTouch * SPEED_PER_TOUCH);
+    const angle = offset * PADDLE_MAX_ANGLE;
+    const vyDir = myRole === 'adrian' ? -1 : 1; // rebota hacia el campo contrario
+    const newVx = Math.sin(angle) * speed;
+    const newVy = Math.cos(angle) * speed * vyDir;
+    const startY = myRole === 'adrian' ? INNER_BOT : INNER_TOP;
+    sendRay(buildRay(ray.xImpact, startY, newVx, newVy, opponentOf(myRole), newTouch));
+  } else {
+    ray.missed = true;
+    logEvent('Fallo mi paleta (' + (myRole === 'adrian' ? 'A' : 'B') + ') — la bola sigue hasta el borde real');
+  }
+}
+
+// Sólo la ejecuta el dispositivo objetivo, en el instante tEdge, y sólo
+// si ya se había marcado como fallo en resolveImpact. Suma el punto para
+// el rival, transmite un "rayo de gol" (congelado en el borde real) para
+// que ambos vean la misma pausa, y programa el siguiente saque —que por
+// convención genera quien acaba de encajar— o el fin de partida.
+function finalizeGoal(ray) {
+  const winnerRole = opponentOf(myRole);
   if (winnerRole === 'adrian') scoreAdrian++; else scoreLuis++;
   updateScoreUI();
   sendScore();
   logEvent('Punto para ' + (winnerRole === 'adrian' ? 'A' : 'B') +
-    ' (bola en el borde real) — marcador ' + scoreAdrian + '-' + scoreLuis);
+    ' (he encajado en mi borde real) — marcador ' + scoreAdrian + '-' + scoreLuis);
 
-  ball.vx = 0;
-  ball.vy = 0;
   const willEndGame = scoreAdrian >= SCORE_WIN || scoreLuis >= SCORE_WIN;
-  sendBallEvent({ goal: true, willEndGame });
+  const edgeY = myRole === 'adrian' ? 1 : 0;
+  sendRay({
+    x0: ray.xEdge, y0: edgeY, vx: 0, vy: 0, targetRole: null,
+    tImpact: 0, xImpact: ray.xEdge, tEdge: 0, xEdge: ray.xEdge,
+    touchCount: 0, goal: true, willEndGame
+  });
 
   setTimeout(() => {
     if (willEndGame) endGame();
-    else hostResetBall();
+    else resetBallAsServer(); // he encajado yo → me toca sacar
   }, GOAL_FREEZE_DURATION);
 }
 
-function physicsStep(dt) {
-  if (!isHost || !gameRunning || connectionPaused || goalPending) return;
+// Se llama una vez por frame. Decide si a mí me toca resolver algo
+// (impacto o gol) en este instante y, en cualquier caso, recalcula la
+// posición visual de la bola a partir del rayo actual.
+function updateBall(now) {
+  const ray = currentRay;
+  if (!ray) return;
+  const elapsed = Math.max(0, (now - rayPlaybackStart) / 1000);
 
-  totalTime += dt;
-  const speedMult = 1 + totalTime * SPEED_INCREMENT;
-
-  ball.x += ball.vx * dt * speedMult;
-  ball.y += ball.vy * dt * speedMult;
-
-  const W = canvas.width;
-  const H = canvas.height;
-  const br  = BALL_R / W;
-  const brY = BALL_R / H;
-
-  // Rebote paredes laterales — cada rebote es un evento que se emite
-  if (ball.x - br < 0) {
-    ball.x = br;
-    ball.vx = Math.abs(ball.vx);
-    sendBallEvent();
-  }
-  if (ball.x + br > 1) {
-    ball.x = 1 - br;
-    ball.vx = -Math.abs(ball.vx);
-    sendBallEvent();
-  }
-
-  const pw = PADDLE_W_RATIO / 2;
-  const topY    = INNER_TOP;
-  const bottomY = INNER_BOT;
-
-  // Colisión paleta superior (Luis) — si ya falló antes, no se vuelve a
-  // comprobar (la paleta no puede "revivir" el punto una vez pasada).
-  if (!missedTop && ball.vy < 0 && ball.y - brY < topY) {
-    if (Math.abs(ball.x - paddleLuis) < pw) {
-      ball.y = topY + brY;
-      ball.vy = Math.abs(ball.vy);
-      const offset = (ball.x - paddleLuis) / pw;
-      ball.vx += offset * 0.1;
-      sendBallEvent();
-    } else {
-      missedTop = true;
-      logEvent('B falla — la bola sigue hasta el borde real de la pantalla');
-    }
-  }
-  // Gol real: la bola alcanza de verdad el borde superior de la pantalla
-  if (missedTop && ball.y - brY <= 0) {
-    ball.y = 0;
-    finalizeGoal('adrian');
+  if (ray.goal) {
+    ball.x = ray.x0;
+    ball.y = ray.y0;
     return;
   }
 
-  // Colisión paleta inferior (Adrian)
-  if (!missedBottom && ball.vy > 0 && ball.y + brY > bottomY) {
-    if (Math.abs(ball.x - paddleAdrian) < pw) {
-      ball.y = bottomY - brY;
-      ball.vy = -Math.abs(ball.vy);
-      const offset = (ball.x - paddleAdrian) / pw;
-      ball.vx += offset * 0.1;
-      sendBallEvent();
-    } else {
-      missedBottom = true;
-      logEvent('A falla — la bola sigue hasta el borde real de la pantalla');
-    }
+  const amTarget = myRole === ray.targetRole;
+
+  if (amTarget && !ray.resolved && elapsed >= ray.tImpact) {
+    ray.resolved = true;
+    resolveImpact(ray);
+    return; // si hubo golpe, sendRay ya ha sustituido currentRay: el
+            // siguiente frame pintará el nuevo rayo con datos frescos.
   }
-  // Gol real: la bola alcanza de verdad el borde inferior de la pantalla
-  if (missedBottom && ball.y + brY >= 1) {
-    ball.y = 1;
-    finalizeGoal('luis');
+
+  if (amTarget && ray.missed && !ray.goalFinalized && elapsed >= ray.tEdge) {
+    ray.goalFinalized = true;
+    finalizeGoal(ray);
     return;
   }
-}
 
-// Reconstruye la posición actual de la bola a partir del último evento
-// recibido, integrando exactamente la misma fórmula de aceleración que
-// usa el host (1 + totalTime · SPEED_INCREMENT), en vez de interpolar
-// una posición aproximada. Sólo lo usa el cliente no-host.
-function getExtrapolatedBall(nowPerf) {
-  if (!lastBallEvent) return null;
-  const elapsed = Math.max(0, (nowPerf - lastBallEvent.tLocal) / 1000);
-  const t0 = lastBallEvent.totalTime;
-  // integral de (1 + SPEED_INCREMENT·(t0+s)) ds entre 0 y elapsed
-  const dispFactor = elapsed + SPEED_INCREMENT * (t0 * elapsed + (elapsed * elapsed) / 2);
-  return {
-    x: lastBallEvent.x + lastBallEvent.vx * dispFactor,
-    y: lastBallEvent.y + lastBallEvent.vy * dispFactor
-  };
+  const pos = ballPositionForRay(ray, elapsed);
+  ball.x = pos.x;
+  ball.y = pos.y;
 }
 
 // ── RENDER ───────────────────────────────────────────────
@@ -1063,17 +1146,6 @@ function render() {
   const W = canvas.width;
   const H = canvas.height;
   ctx.clearRect(0, 0, W, H);
-
-  // No-host: recalcular la posición de la bola por extrapolación exacta.
-  // Si está en pausa por el seguro de sincronía, se congela tal cual está.
-  if (!isHost && !connectionPaused) {
-    const ext = getExtrapolatedBall(performance.now());
-    if (ext) {
-      const brX = BALL_R / W;
-      ball.x = Math.min(1 - brX, Math.max(brX, ext.x));
-      ball.y = ext.y;
-    }
-  }
 
   const pw = PADDLE_W_RATIO * W;
 
@@ -1084,8 +1156,8 @@ function render() {
     ? getComputedStyle(document.documentElement).getPropertyValue('--adrian').trim()
     : getComputedStyle(document.documentElement).getPropertyValue('--luis').trim();
 
-  // Paleta de arriba en la pantalla de cada jugador = rival
-  // Paleta de abajo = yo mismo
+  // Paleta de arriba en la pantalla de cada jugador = rival (cosmética)
+  // Paleta de abajo = yo mismo (autoridad local)
   const topPaddleX    = myRole === 'adrian' ? paddleLuis   : paddleAdrian;
   const bottomPaddleX = myRole === 'adrian' ? paddleAdrian : paddleLuis;
 
@@ -1124,13 +1196,11 @@ function render() {
 // ── LOOP ─────────────────────────────────────────────────
 function loop(now) {
   if (!gameRunning) return;
-  const dt = Math.min((now - lastTime) / 1000, 0.05);
-  lastTime = now;
 
   checkConnectionHealth();
   updateBot();
   if (!connectionPaused) {
-    physicsStep(dt);
+    updateBall(now);
   }
   render();
   requestAnimationFrame(loop);
