@@ -440,6 +440,15 @@ const PADDLE_MAX_ANGLE = 60 * Math.PI / 180; // abanico del rebote en paleta,
 // Supabase, sin que afecte nunca a la física del juego.
 const PADDLE_SEND_INTERVAL = 50; // ms → máx. ~20 envíos/segundo
 
+// Supabase Broadcast es "fire and forget": no confirma entrega. Si el
+// mensaje de un rayo se pierde (o llega durante un CLOSED/reconexión),
+// el rival se quedaría reproduciendo el rayo anterior sin enterarse del
+// cambio. Como red de seguridad, reenviamos el mismo mensaje (mismo
+// número de secuencia) estos milisegundos después del envío original —
+// variable ajustable: más reintentos = más resistencia a pérdidas, a
+// costa de más tráfico en Supabase.
+const RAY_RESEND_DELAYS = [150, 400]; // ms tras el envío original
+
 // Seguro de sincronía: latido periódico + timeout de pausa simétrica
 const HEARTBEAT_INTERVAL = 1000; // ms entre latidos
 const HEARTBEAT_TIMEOUT  = 3000; // ms sin señal del rival → pausa
@@ -472,6 +481,15 @@ let gameRunning = false;
 // nunca hace falta sincronizar relojes entre los dos móviles.
 let currentRay = null;
 let rayPlaybackStart = 0;
+
+// Número de secuencia más alto que he adoptado hasta ahora (generado por
+// mí o recibido). Cada rayo nuevo se numera como "el siguiente" a partir
+// de éste, encadenado — nunca lo reinician los dos dispositivos por
+// separado, así que no hay forma de que coincidan dos rayos distintos
+// con el mismo número. Sirve para dos cosas: descartar reenvíos
+// duplicados sin que reinicien la reproducción, y que el resync de
+// heartbeat sepa si lo que trae es más nuevo que lo que ya tengo.
+let lastKnownRaySeq = -1;
 
 let dragging = false;
 let dragStartX = 0;
@@ -660,13 +678,21 @@ function initChannel() {
     })
     .on('broadcast', { event: 'ray' }, ({ payload }) => {
       // Un rayo completo (saque, rebote de paleta, o gol), generado por
-      // quien golpeó la bola. Lo adopto y empiezo a reproducirlo desde
-      // ya —con MI reloj local— y, si me toca a mí (targetRole ===
-      // myRole), el propio bucle principal se encargará de decidir en
-      // tImpact/tEdge cuando llegue el momento.
-      currentRay = { ...payload, resolved: false, missed: false, goalFinalized: false };
-      rayPlaybackStart = performance.now();
-      logEvent('rayo recibido objetivo=' + payload.targetRole +
+      // quien golpeó la bola. Cada rayo lleva un número de secuencia
+      // (payload.seq) estrictamente creciente: si esto es un reenvío de
+      // refuerzo de un rayo que ya tengo, o llega desordenado detrás de
+      // uno más nuevo, lo descarto — así los reintentos son inofensivos
+      // y nunca reinician la reproducción por sorpresa.
+      if (currentRay && payload.seq <= currentRay.seq) {
+        logEvent('rayo duplicado/atrasado ignorado (seq=' + payload.seq + ')');
+        return;
+      }
+      // Lo adopto y empiezo a reproducirlo desde ya —con MI reloj
+      // local— y, si me toca a mí (targetRole === myRole), el propio
+      // bucle principal se encargará de decidir en tImpact/tEdge cuando
+      // llegue el momento.
+      adoptRay(payload, performance.now());
+      logEvent('rayo recibido (seq=' + payload.seq + ') objetivo=' + payload.targetRole +
         ' x0=' + payload.x0.toFixed(3) + ' y0=' + payload.y0.toFixed(3) +
         ' vx=' + payload.vx.toFixed(3) + ' vy=' + payload.vy.toFixed(3) +
         (payload.goal ? ' [GOL]' : (' tImpact=' + payload.tImpact.toFixed(2) + 's')));
@@ -689,14 +715,15 @@ function initChannel() {
       lastHeartbeatReceived = performance.now();
       if (connectionPaused) resumeConnection();
       logEvent('heartbeat recibido de ' + payload.role + (wasPaused ? ' (reanuda tras pausa)' : ''));
-      // Red de seguridad: si por lo que sea me he quedado sin rayo
-      // (p.ej. me acabo de reconectar a media jugada y me perdí el
-      // evento 'ray'), adopto el que traiga el latido, restando el
-      // tiempo que ya llevaba jugándose para no reiniciarlo desde cero.
-      if (payload.ray && !currentRay) {
-        currentRay = { ...payload.ray, resolved: false, missed: false, goalFinalized: false };
-        rayPlaybackStart = performance.now() - (payload.elapsed || 0) * 1000;
-        logEvent('Rayo adoptado desde heartbeat (resync de emergencia)');
+      // Red de seguridad: si el mensaje 'ray' se perdió por el camino
+      // (no solo si me quedé sin rayo del todo, sino también si tengo
+      // uno más viejo que el que corresponde), adopto el que traiga el
+      // latido, restando el tiempo que ya llevaba jugándose para no
+      // reiniciarlo desde cero. La comparación es por seq, así que esto
+      // también corrige el caso de "tengo un rayo, pero atrasado".
+      if (payload.ray && (!currentRay || payload.ray.seq > currentRay.seq)) {
+        adoptRay(payload.ray, performance.now() - (payload.elapsed || 0) * 1000);
+        logEvent('Rayo resincronizado desde heartbeat (seq=' + payload.ray.seq + ')');
       }
     })
     .on('broadcast', { event: 'pause' }, () => {
@@ -920,6 +947,7 @@ function tryStartRestart() {
   scoreAdrian = 0; scoreLuis = 0;
   updateScoreUI();
   currentRay = null;
+  lastKnownRaySeq = -1;
   ball = { x: 0.5, y: 0.5 };
   connectionPaused = false;
   pauseStartedAt = null;
@@ -1018,11 +1046,33 @@ function buildRay(x0, y0, vx, vy, targetRole, touchCount) {
 // fórmula para quien generó el rayo y para quien lo recibió — sólo
 // cambia el instante local (rayPlaybackStart) desde el que cada uno
 // cuenta ese "elapsed".
+//
+// Nunca se muestra la bola más allá de la línea de paleta de ESTE rayo
+// (tImpact): a partir de ahí se congela justo en el punto de cruce, sin
+// invadir el espacio donde está o se mueve la paleta. Eso vale tanto si
+// termina siendo un rebote como si termina siendo gol — en los dos casos
+// la resolución la trae un rayo NUEVO (el del rebote, o el de gol
+// congelado en el borde), y hasta que ese rayo nuevo llega, preferimos
+// dejar de mostrar avance antes que enseñar una bola atravesando la
+// paleta o el fondo sin que aún sea real. El pequeño hueco que se ve
+// mientras tanto es el retraso de red — ya se cuenta con él.
 function ballPositionForRay(ray, elapsed) {
   if (ray.goal) return { x: ray.x0, y: ray.y0 };
-  const x = foldX(ray.x0 + ray.vx * elapsed, BALL_R_NORM, 1 - BALL_R_NORM);
-  const y = Math.min(1, Math.max(0, ray.y0 + ray.vy * elapsed));
+  const cappedElapsed = Math.min(elapsed, ray.tImpact);
+  const x = foldX(ray.x0 + ray.vx * cappedElapsed, BALL_R_NORM, 1 - BALL_R_NORM);
+  const y = Math.min(1, Math.max(0, ray.y0 + ray.vy * cappedElapsed));
   return { x, y };
+}
+
+// Adopta un rayo (mío o recibido) como el que se está reproduciendo
+// ahora: fija el estado de resolución a cero y ancla el reloj local de
+// reproducción. Centraliza también la actualización de lastKnownRaySeq,
+// para que tanto sendRay como los handlers de red (ray/heartbeat) numeren
+// siempre a partir del mismo contador.
+function adoptRay(rayPayload, playbackStart) {
+  currentRay = { ...rayPayload, resolved: false, missed: false, goalFinalized: false };
+  rayPlaybackStart = playbackStart;
+  if (rayPayload.seq > lastKnownRaySeq) lastKnownRaySeq = rayPayload.seq;
 }
 
 // La llama quien genera el rayo: quien saca, o quien acaba de devolver
@@ -1030,14 +1080,31 @@ function ballPositionForRay(ray, elapsed) {
 // propio dispositivo (retraso ~0) — el rival lo recibirá con el retraso
 // de red que corresponda y arrancará su propia reproducción en ese
 // instante (ver el handler del evento 'ray').
-function sendRay(ray) {
+function sendRay(rawRay) {
+  const ray = { ...rawRay, seq: lastKnownRaySeq + 1 };
   channel.send({ type: 'broadcast', event: 'ray', payload: ray });
-  currentRay = { ...ray, resolved: false, missed: false, goalFinalized: false };
-  rayPlaybackStart = performance.now();
-  logEvent('rayo enviado (' + myRole + ') objetivo=' + ray.targetRole +
+  adoptRay(ray, performance.now());
+  logEvent('rayo enviado (' + myRole + ', seq=' + ray.seq + ') objetivo=' + ray.targetRole +
     ' x0=' + ray.x0.toFixed(3) + ' y0=' + ray.y0.toFixed(3) +
     ' vx=' + ray.vx.toFixed(3) + ' vy=' + ray.vy.toFixed(3) +
     (ray.goal ? ' [GOL, fin=' + ray.willEndGame + ']' : ' tImpact=' + ray.tImpact.toFixed(2) + 's'));
+
+  // Reenvíos de refuerzo: Supabase Broadcast no confirma entrega. Si
+  // sigo "sobre" este mismo rayo cuando llega cada plazo, lo reenvío tal
+  // cual (mismo seq) — el receptor lo descarta si ya lo tiene, así que
+  // esto es inofensivo si el primer envío sí llegó, y nos salva si no.
+  RAY_RESEND_DELAYS.forEach(delay => {
+    setTimeout(() => {
+      if (channel && currentRay && currentRay.seq === ray.seq) {
+        try {
+          channel.send({ type: 'broadcast', event: 'ray', payload: ray });
+          logEvent('rayo reenviado (seq=' + ray.seq + ', +' + delay + 'ms)');
+        } catch (e) {
+          logEvent('Aviso al reenviar rayo: ' + e.message);
+        }
+      }
+    }, delay);
+  });
 }
 
 // Saque: por convención, Jugador A lo genera el primero de cada partida;
